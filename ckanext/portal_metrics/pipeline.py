@@ -236,7 +236,7 @@ class ResourceCache:
                         "org_id": org_id,
                         "org_name": org_name,
                         "format": res.get("format", ""),
-                        "name": res.get("name", ""),
+                        "page_title": res.get("name", ""),
                     }
 
             # next page
