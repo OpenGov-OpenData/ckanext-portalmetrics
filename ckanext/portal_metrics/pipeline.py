@@ -7,16 +7,16 @@ import pandas as pd
 from google.analytics.data_v1beta import (
     BetaAnalyticsDataClient,
     FilterExpression,
+    FilterExpressionList,
 )
 from google.analytics.data_v1beta.types import (
     DateRange,
     Dimension,
     Metric,
     RunReportRequest,
-    Filter,
+    Filter
 )
 from ckan.plugins import toolkit as tk
-
 
 # -----------------------------------------------------------------------------
 # Logging config
@@ -51,12 +51,18 @@ class GA4Exporter:
     MAX_RETRIES = 3
     RETRY_BACKOFF = 2  # seconds
 
-    DIMENSIONS = [
-        "date", "pagePath", "pageTitle", "hostName"
+    ANALYTICS_DIMENSIONS = [
+        "date", "pagePath", "pageTitle", "hostName",
     ]
-    METRICS = [
+    ANALYTICS_METRICS = [
         "screenPageViews", "totalUsers", "userEngagementDuration",
-        "activeUsers", "averageSessionDuration", "newUsers"
+        "activeUsers", "averageSessionDuration", "newUsers",
+    ]
+    DOWNLOADS_DIMENSIONS = [
+        "date", "pagePath", "pageTitle", "hostName", "fileName", "fileExtension"
+    ]
+    DOWNLOADS_METRICS = [
+        "eventCount"
     ]
 
     def __init__(self, creds, property_id, hostname):
@@ -64,14 +70,11 @@ class GA4Exporter:
         self.hostname = hostname
         self.client = BetaAnalyticsDataClient(credentials=creds)
 
-    def _fetch_page(self, start_date, end_date, offset, limit):
-        """
-        Fetch a single page of results from GA4 with retry logic and error logging.
-        """
-        req = RunReportRequest(
+    def _fetch_analytics(self, start_date, end_date, offset, limit):
+        return RunReportRequest(
             property=f"properties/{self.property_id}",
-            dimensions=[Dimension(name=n) for n in self.DIMENSIONS],
-            metrics=[Metric(name=m) for m in self.METRICS],
+            dimensions=[Dimension(name=n) for n in self.ANALYTICS_DIMENSIONS],
+            metrics=[Metric(name=m) for m in self.ANALYTICS_METRICS],
             date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
             dimension_filter=FilterExpression(
                 filter=Filter(
@@ -87,6 +90,55 @@ class GA4Exporter:
             limit=limit,
         )
 
+    def _fetch_downloads(self, start_date, end_date, offset, limit):
+        return RunReportRequest(
+            property=f"properties/{self.property_id}",
+            dimensions=[Dimension(name=n) for n in self.DOWNLOADS_DIMENSIONS],
+            metrics=[Metric(name=m) for m in self.DOWNLOADS_METRICS],
+            date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+            dimension_filter=FilterExpression(
+                and_group=FilterExpressionList(
+                    expressions=[
+                        # eventName == file_download
+                        FilterExpression(
+                            filter=Filter(
+                                field_name="eventName",
+                                string_filter=Filter.StringFilter(value="file_download")
+                            )
+                        ),
+                        # fileExtension NOT empty
+                        FilterExpression(
+                            not_expression=FilterExpression(
+                                filter=Filter(
+                                    field_name="fileExtension",
+                                    empty_filter=Filter.EmptyFilter()
+                                )
+                            )
+                        ),
+                        # hostName == your hostname
+                        FilterExpression(
+                            filter=Filter(
+                                field_name="hostName",
+                                string_filter=Filter.StringFilter(
+                                    value=self.hostname,
+                                    match_type=Filter.StringFilter.MatchType.EXACT,
+                                    case_sensitive=False
+                                )
+                            )
+                        ),
+                    ]
+                )
+            ),
+            offset=offset,
+            limit=limit,
+        )
+
+    def _fetch_page(self, start_date, end_date, offset, limit, func):
+        """
+        Fetch a single page of results from GA4 with retry logic and error logging.
+        """
+        req = func(start_date, end_date, offset, limit)
+
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 return self.client.run_report(req)
@@ -99,7 +151,7 @@ class GA4Exporter:
                     raise
                 time.sleep(self.RETRY_BACKOFF * attempt)
 
-    def fetch_all(self, start_date, end_date, page_size=MAX_GA_PAGE_SIZE):
+    def _fetch_all(self, start_date, end_date, func, page_size=MAX_GA_PAGE_SIZE):
         """
         Fetch all rows from GA4 for the specified date range, transparently handling pagination.
 
@@ -115,7 +167,7 @@ class GA4Exporter:
         total_rows = 0
 
         while True:
-            resp = self._fetch_page(start_date, end_date, offset, page_size)
+            resp = self._fetch_page(start_date, end_date, offset, page_size, func)
             df = self.to_dataframe(resp)
             if df.empty:
                 break
@@ -132,7 +184,13 @@ class GA4Exporter:
             return pd.concat(all_rows, ignore_index=True)
         else:
             logger.warning("No data returned from GA4 for the given date range.")
-            return pd.DataFrame(columns=self.DIMENSIONS + self.METRICS)
+            return pd.DataFrame(columns=self.ANALYTICS_DIMENSIONS + self.ANALYTICS_METRICS)
+
+    def fetch_analytics(self, start_date, end_date):
+        return self._fetch_all(start_date, end_date, self._fetch_analytics)
+
+    def fetch_downloads(self, start_date, end_date):
+        return self._fetch_all(start_date, end_date, self._fetch_downloads)
 
     def to_dataframe(self, resp):
         dims = [h.name for h in resp.dimension_headers]
@@ -155,12 +213,10 @@ class MetricsProcessor:
     INT_COLS = [
         "userEngagementDuration", "totalUsers",
         "screenPageViews", "averageSessionDuration",
-        "newUsers", "activeUsers"
+        "newUsers", "activeUsers", "eventCount"
     ]
-    RE_VIEW = re.compile(r"/view/.*$")
-    RE_RESOURCE = re.compile(r"((?:/resource/[a-f0-9-]+))/.*")
-
-    AGG_MAP = {
+    ANALYTICS_AGG_MAP = {
+        "group_by": ["date", "page_path"],
         "user_engagement_duration": ("userEngagementDuration", "sum"),
         "total_users": ("totalUsers", "sum"),
         "new_users": ("newUsers", "sum"),
@@ -169,6 +225,15 @@ class MetricsProcessor:
         "avg_session_duration": ("averageSessionDuration", "mean"),
         "page_title": ("pageTitle", lambda s: " | ".join(sorted({x for x in s if pd.notna(x) and x}))),
     }
+    DOWNLOADS_AGG_MAP = {
+        "group_by": ["date", "file_name"],
+        "downloads": ("eventCount", "sum"),
+        "page_title": ("pageTitle", lambda s: " | ".join(sorted({x for x in s if pd.notna(x) and x}))),
+        "file_extension": ("fileExtension", lambda s: " | ".join(sorted({x for x in s if pd.notna(x) and x}))),
+        "page_path": ("pagePath", lambda s: " | ".join(sorted({x for x in s if pd.notna(x) and x}))),
+    }
+    RE_VIEW = re.compile(r"/view/.*$")
+    RE_RESOURCE = re.compile(r"((?:/resource/[a-f0-9-]+))/.*")
 
     def clean(self, df):
         # drop unused
@@ -180,22 +245,17 @@ class MetricsProcessor:
         df[list(ints)] = (df[list(ints)]
                           .apply(pd.to_numeric, errors="coerce", downcast='integer')
                           .fillna(0))
-
         # page_path
-        df["page_path"] = (
-            df.get("pagePath", "")
-            .fillna("")
-            .str.replace(self.RE_VIEW, "", regex=True)
-            .str.replace(self.RE_RESOURCE, r"\1", regex=True)
-            .str.strip()
-        )
+        df["page_path"] = (df.get("pagePath", "").fillna("").str.strip())
         return df
 
-    def aggregate(self, df):
+    def aggregate(self, df, aggr_map):
         # only keep aggregations for available columns
-        agg = {k: v for k, v in self.AGG_MAP.items() if v[0] in df.columns}
-        by = [c for c in ("date", "page_path") if c in df.columns]
-        return df.groupby(by, dropna=False).agg(**agg).reset_index()
+        group_by = aggr_map.pop("group_by")
+        agg = {k: v for k, v in aggr_map.items() if v[0] in df.columns}
+        df = df.groupby(group_by, dropna=False)
+        df = df.agg(**agg).reset_index()
+        return df
 
 
 # -----------------------------------------------------------------------------
@@ -230,13 +290,15 @@ class ResourceCache:
                 org = pkg.get("organization") or {}
                 org_id = org.get("id", "")
                 org_name = org.get("name", "")
+                groups = [group.get('display_name', '') for group in pkg.get("groups", [])]
 
                 for res in pkg.get("resources", []):
                     self._cache[res["id"]] = {
                         "org_id": org_id,
                         "org_name": org_name,
                         "format": res.get("format", ""),
-                        "page_title": res.get("name", ""),
+                        "resource_name": res.get("name", ""),
+                        "groups": '; '.join(groups),
                     }
 
             # next page
@@ -254,10 +316,12 @@ class ResourceCache:
 class CkanClient:
     MAX_RETRIES = 3
     RETRY_BACKOFF = 2
-    MAX_CKAN_UPSERT_BATCH_SIZE = 10000
-    DATA_DICT = [
+    MAX_CKAN_UPSERT_BATCH_SIZE = 5000
+    ANALYTICS_DATA_DICT = [
         {"id": "date", "type": "date"},
         {"id": "page_path", "type": "text"},
+        {"id": "resource_id", "type": "text"},
+        {"id": "resource_name", "type": "text"},
         {"id": "user_engagement_duration", "type": "int"},
         {"id": "total_users", "type": "int"},
         {"id": "new_users", "type": "int"},
@@ -268,6 +332,21 @@ class CkanClient:
         {"id": "org_id", "type": "text"},
         {"id": "org_name", "type": "text"},
         {"id": "format", "type": "text"},
+        {"id": "groups", "type": "text"},
+    ]
+    DOWNLOADS_DATA_DICT = [
+        {"id": "date", "type": "date"},
+        {"id": "file_name", "type": "text"},
+        {"id": "resource_id", "type": "text"},
+        {"id": "resource_name", "type": "text"},
+        {"id": "page_path", "type": "text"},
+        {"id": "downloads", "type": "int"},
+        {"id": "file_extension", "type": "text"},
+        {"id": "page_title", "type": "text"},
+        {"id": "org_id", "type": "text"},
+        {"id": "org_name", "type": "text"},
+        {"id": "format", "type": "text"},
+        {"id": "groups", "type": "text"},
     ]
 
     def __init__(self, context):
@@ -296,22 +375,23 @@ class CkanClient:
             if r["name"] == name:
                 return r["id"]
 
-    def upsert(self, df, dataset_id, resource_id=None):
+    def upsert(self, df, dataset_id, name, datadict, pk, resource_id=None):
         records = df.to_dict(orient="records")
         if not resource_id:
             payload = {
                 "resource": {
                     "package_id": dataset_id,
-                    "name": "Portal Analytics Data",
+                    "name": name,
                     "format": "csv"
                 },
-                "fields": self.DATA_DICT,
-                "primary_key": ["date", "page_path"],
-                "records": records[:25],
+                "fields": datadict,
+                "primary_key": pk,
+                "records": records[:5],
                 "force": True
             }
             result = tk.get_action('datastore_create')(self.context, payload)
             resource_id = result["resource_id"]
+            time.sleep(20)
 
         for i in range(0, len(records), self.MAX_CKAN_UPSERT_BATCH_SIZE):
             batch = records[i:i + self.MAX_CKAN_UPSERT_BATCH_SIZE]
@@ -363,17 +443,27 @@ class MetricsPipeline:
         start_date = (date.today() - timedelta(days=self.lookback)).isoformat()
         end_date = date.today().isoformat()
         # 1) Extract & transform
-        df = self.ga4.fetch_all(start_date, end_date)
-        df = self.proc.clean(df)
-        df = self.proc.aggregate(df)
+        dfa = self.ga4.fetch_analytics(start_date, end_date)
+        dfa = self.proc.clean(dfa)
+        dfa = self.proc.aggregate(dfa, self.proc.ANALYTICS_AGG_MAP)
 
-        # 2) Enrich titles + org/format
-        df["uuid"] = df["page_path"].str.extract(r"/resource/([0-9a-fA-F\-]{36})")[0]
-        meta = df["uuid"].map(self.cache.get).apply(pd.Series)
-        df = pd.concat([df, meta], axis=1).drop(columns=["uuid"])
-        # 3) Upsert to CKAN
-        ds_id = self.ckan.ensure_dataset(self.owner_org)
-        res_id = self.ckan.find_resource(ds_id)
-        self.ckan.upsert(df, ds_id, res_id)
+        dfd = self.ga4.fetch_downloads(start_date, end_date)
+        dfd = self.proc.clean(dfd)
+        dfd = dfd.rename(columns={"fileName": "file_name"})
+        dfd = self.proc.aggregate(dfd, self.proc.DOWNLOADS_AGG_MAP)
+
+        config = [
+            ("Portal Analytics Data", dfa, self.ckan.ANALYTICS_DATA_DICT, ["date", "page_path"], "page_path"),
+            ("Portal Downloads Data", dfd, self.ckan.DOWNLOADS_DATA_DICT, ["date", "file_name"], "file_name")
+        ]
+        for name, df, data_dict, pk, uuid_source in config:
+            # 2) Enrich titles + org/format
+            df["resource_id"] = df[uuid_source].str.extract(r"/resource/([0-9a-fA-F\-]{36})")[0]
+            meta = df["resource_id"].map(self.cache.get).apply(pd.Series)
+            df = pd.concat([df, meta], axis=1)
+            # 3) Upsert to CKAN
+            ds_id = self.ckan.ensure_dataset(self.owner_org)
+            res_id = self.ckan.find_resource(ds_id, name)
+            self.ckan.upsert(df, ds_id, name, data_dict, resource_id=res_id, pk=pk)
 
         logger.info("Pipeline completed successfully")

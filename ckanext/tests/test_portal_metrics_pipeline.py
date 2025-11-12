@@ -1,14 +1,11 @@
 from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
-
 import pandas as pd
 import pytest
-
 import ckanext.portal_metrics.pipeline as pl
 
 
-# ─────────────────────────────── Fixtures ────────────────────────────────────
 @pytest.fixture(scope="session")
 def tk_stub():
     """Minimal replacement for ckan.plugins.toolkit."""
@@ -23,7 +20,6 @@ def _use_stub_toolkit(monkeypatch, tk_stub):
 
 @pytest.fixture(scope="session")
 def ga4_resp():
-
     def make_hdr(n):
         return SimpleNamespace(name=n)
 
@@ -44,20 +40,10 @@ def ga4_resp():
 
 
 @pytest.fixture
-def ga4_empty(ga4_resp):
-    """Same headers, but 0 rows."""
-    return SimpleNamespace(
-        dimension_headers=ga4_resp.dimension_headers,
-        metric_headers=ga4_resp.metric_headers,
-        rows=[],
-    )
-
-
-@pytest.fixture
 def df_raw():
     return pd.DataFrame(
         {
-            "date": ["2024-01-01", "2024-01-02"],
+            "date": ["20240101", "20240102"],
             "pagePath": ["/foo", "/bar"],
             "totalUsers": [5, 10],
             "userEngagementDuration": [100, 200],
@@ -70,7 +56,6 @@ def df_raw():
     )
 
 
-# ───────────────────────────── GA4Exporter ───────────────────────────────────
 def test_ga4_to_dataframe(ga4_resp):
     exp = pl.GA4Exporter(creds=object(), property_id="pid", hostname="h")
     df = exp.to_dataframe(ga4_resp)
@@ -79,29 +64,41 @@ def test_ga4_to_dataframe(ga4_resp):
 
 
 @patch.object(pl, "BetaAnalyticsDataClient")
-def test_ga4_pagination(mock_cli, ga4_resp, ga4_empty):
-    mock_cli.return_value.run_report.side_effect = [ga4_resp, ga4_empty]
+def test_ga4_pagination(mock_cli, ga4_resp):
+    # First page has rows, second is empty to stop the loop
+    empty_resp = SimpleNamespace(
+        dimension_headers=ga4_resp.dimension_headers,
+        metric_headers=ga4_resp.metric_headers,
+        rows=[],
+    )
+    mock_cli.return_value.run_report.side_effect = [ga4_resp, empty_resp]
     exp = pl.GA4Exporter(creds=object(), property_id="pid", hostname="h")
     exp.client = mock_cli.return_value
-    assert len(exp.fetch_all("2024-01-01", "2024-01-02", 2)) == 2
+    df = exp.fetch_analytics("2024-01-01", "2024-01-02")
+    assert len(df) == 2
 
 
 @patch.object(pl, "BetaAnalyticsDataClient")
-def test_ga4_retry(mock_cli, ga4_resp, ga4_empty, monkeypatch):
+def test_ga4_retry(mock_cli, ga4_resp, monkeypatch):
+    empty_resp = SimpleNamespace(
+        dimension_headers=ga4_resp.dimension_headers,
+        metric_headers=ga4_resp.metric_headers,
+        rows=[],
+    )
     mock_cli.return_value.run_report.side_effect = [
         RuntimeError("boom"),
         ga4_resp,
-        ga4_empty,
+        empty_resp,
     ]
     monkeypatch.setattr(pl.time, "sleep", lambda *_: None)
     exp = pl.GA4Exporter(creds=object(), property_id="pid", hostname="h")
     exp.client = mock_cli.return_value
-    assert len(exp.fetch_all("2024-01-01", "2024-01-02", 2)) == 2
+    df = exp.fetch_analytics("2024-01-01", "2024-01-02")
+    assert len(df) == 2
 
 
-def test_page_size_capped(monkeypatch, ga4_resp):
+def test_page_size_passthrough(monkeypatch, ga4_resp):
     exporter = pl.GA4Exporter(creds=object(), property_id="pid", hostname="h")
-
     # Build an empty response that keeps the required header attributes
     empty_resp = SimpleNamespace(
         dimension_headers=ga4_resp.dimension_headers,
@@ -109,24 +106,22 @@ def test_page_size_capped(monkeypatch, ga4_resp):
         rows=[],
     )
 
-    monkeypatch.setattr(exporter, "_fetch_page",
-                        lambda *a, **k: empty_resp)
-    exporter.MAX_PAGE_SIZE = 10
+    # Force _fetch_all to finish immediately
+    monkeypatch.setattr(exporter, "_fetch_page", lambda *a, **k: empty_resp)
 
-    # Should cap page_size and exit without error
-    exporter.fetch_all("2020-01-01", "2020-01-02", page_size=99)
+    # Should accept provided page_size and exit without error
+    exporter._fetch_all("2020-01-01", "2020-01-02", exporter._fetch_analytics, page_size=99)
 
 
-# ───────────────────── MetricsProcessor (clean / aggregate) ──────────────────
 def test_metrics_processor(df_raw):
     proc = pl.MetricsProcessor()
     cleaned = proc.clean(df_raw)
-    result = proc.aggregate(cleaned)
+    # Use a copy of the map to avoid mutation by pop("group_by")
+    result = proc.aggregate(cleaned, dict(proc.ANALYTICS_AGG_MAP))
     assert "page_path" in cleaned
     assert not result.empty
 
 
-# ───────────────────────── CkanClient helpers ────────────────────────────────
 class _Sentinel(Exception):
     """Local stand-in for tk.ObjectNotFound during parametrisation."""
 
@@ -181,17 +176,19 @@ def test_upsert_retry(monkeypatch, df_raw, tk_stub):
     }[n]
     monkeypatch.setattr(pl.time, "sleep", lambda *_: None)
 
-    pl.CkanClient({"user": "u"}).upsert(df_raw, "ds")
+    pl.CkanClient({"user": "u"}).upsert(
+        df_raw, "ds", name="Test", datadict=[], pk=["date"]
+    )
     assert attempts["n"] == 2
 
 
-# ───────────────────────────── ResourceCache  ────────────────────────────────
 def test_resource_cache():
     class Dummy:
         def list_packages_with_resources(self, *_, **__):
             return [
                 {
                     "organization": {"id": "org", "name": "ORG"},
+                    "groups": [{"display_name": "grp"}],
                     "resources": [{"id": "rid", "format": "CSV", "name": "foo"}],
                 }
             ]
@@ -200,46 +197,11 @@ def test_resource_cache():
     assert cache.get("rid")["format"] == "CSV"
 
 
-# ──────────────────────────── MetricsPipeline  ───────────────────────────────
-@patch.object(pl.CkanClient, "ensure_dataset", return_value="ds")
-@patch.object(pl.CkanClient, "find_resource", return_value="rid")
-@patch.object(pl.CkanClient, "upsert")
-@patch.object(pl.CkanClient, "list_packages_with_resources", return_value=[])
-@patch.object(pl.ResourceCache, "get", return_value={})
-@patch.object(pl.MetricsProcessor, "aggregate", side_effect=lambda df, *_, **__: df)
-@patch.object(pl.MetricsProcessor, "clean",
-              side_effect=lambda df, *_, **__: df.assign(page_path=df["pagePath"]))
-@patch.object(
-    pl.GA4Exporter,
-    "fetch_all",
-    return_value=pd.DataFrame(
-        {"date": [date.today().isoformat()], "pagePath": ["/foo"]}
-    ),
-)
-def test_pipeline(*_):
-    pl.MetricsPipeline("pid", "host", {"user": "u"}, object(), 1, "org").run()
-
-
-@pytest.fixture(autouse=True)
-def _stub_tk(monkeypatch):
-    tk = SimpleNamespace(ObjectNotFound=Exception, get_action=lambda *_: None)
-    monkeypatch.setattr(pl, "tk", tk, raising=False)
-
-
-def test_retry_exhaust(monkeypatch):
-    exporter = pl.GA4Exporter(creds=object(), property_id="pid", hostname="h")
-    exporter.MAX_RETRIES = 2
-    monkeypatch.setattr(exporter, "_fetch_page", lambda *a, **k: (_ for _ in ()).throw(RuntimeError))
-    monkeypatch.setattr(pl.time, "sleep", lambda *_: None)
-    with pytest.raises(RuntimeError):
-        exporter.fetch_all("2020-01-01", "2020-01-02", page_size=2)
-
-
 def test_resource_cache_pagination(monkeypatch):
     pages = [
         [
-            {"organization": {"id": "x"}, "resources": [{"id": "a"}]},
-            {"organization": {"id": "x"}, "resources": [{"id": "b"}]},
+            {"organization": {"id": "x"}, "resources": [{"id": "a"}], "groups": []},
+            {"organization": {"id": "x"}, "resources": [{"id": "b"}], "groups": []},
         ],
         [],
     ]
@@ -253,6 +215,50 @@ def test_resource_cache_pagination(monkeypatch):
     assert cache.get("b") != {}
 
 
+@patch.object(pl.CkanClient, "ensure_dataset", return_value="ds")
+@patch.object(pl.CkanClient, "find_resource", return_value="rid")
+@patch.object(pl.CkanClient, "upsert")
+@patch.object(pl.CkanClient, "list_packages_with_resources", return_value=[])
+@patch.object(pl.ResourceCache, "get", return_value={})
+@patch.object(pl.MetricsProcessor, "aggregate", side_effect=lambda df, *_, **__: df)
+@patch.object(pl.MetricsProcessor, "clean",
+              side_effect=lambda df: df.assign(page_path=df.get("pagePath", "")))
+@patch.object(
+    pl.GA4Exporter,
+    "fetch_downloads",
+    return_value=pd.DataFrame(
+        {
+            "date": [date.today().isoformat()],
+            "pagePath": ["/foo"],
+            "fileName": ["report /dataset/x/resource/123e4567-e89b-12d3-a456-426614174000.csv"],
+        }
+    ),
+)
+@patch.object(
+    pl.GA4Exporter,
+    "fetch_analytics",
+    return_value=pd.DataFrame(
+        {"date": [date.today().isoformat()], "pagePath": ["/foo"]}
+    ),
+)
+def test_pipeline(*_mocks):
+    pl.MetricsPipeline("pid", "host", {"user": "u"}, object(), 1, "org").run()
+
+
+def test_retry_exhaust(monkeypatch):
+    exporter = pl.GA4Exporter(creds=object(), property_id="pid", hostname="h")
+    exporter.MAX_RETRIES = 2
+
+    # Make every _fetch_page call raise
+    def _raise(*_a, **_k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(exporter, "_fetch_page", _raise)
+    monkeypatch.setattr(pl.time, "sleep", lambda **kwargs: None)
+    with pytest.raises(RuntimeError):
+        exporter.fetch_analytics("2020-01-01", "2020-01-02")
+
+
 def test_upsert_skip_create(monkeypatch):
     calls = {"upsert": 0}
 
@@ -263,5 +269,12 @@ def test_upsert_skip_create(monkeypatch):
     tk = SimpleNamespace(get_action=lambda n: ds_upsert if n == "datastore_upsert" else None)
     monkeypatch.setattr(pl, "tk", tk, raising=False)
     cli = pl.CkanClient({"user": "u"})
-    cli.upsert(pl.pd.DataFrame({"x": [1]}), dataset_id="ds", resource_id="rid")
+    cli.upsert(
+        pd.DataFrame({"x": [1]}),
+        dataset_id="ds",
+        resource_id="rid",
+        name="Test",
+        datadict=[],
+        pk=["x"],
+    )
     assert calls["upsert"] == 1
