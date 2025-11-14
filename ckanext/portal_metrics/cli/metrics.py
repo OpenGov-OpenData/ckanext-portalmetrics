@@ -18,7 +18,8 @@ def metrics():
 @click.option('--lookback-days', default=3, show_default=True, type=int,
               help='How many days back to fetch metrics')
 @click.option('--owner-org', default=None, help='CKAN organization for dataset (default: portal-metrics)')
-def fetch_metrics(lookback_days, owner_org):
+@click.option('--property-id-override', default=None, help='GA4 property_id (default: from ckan.ini)')
+def fetch_metrics(lookback_days, owner_org, property_id_override):
     """
     Fetch Google Analytics metrics and upsert into CKAN datastore.
     """
@@ -29,7 +30,10 @@ def fetch_metrics(lookback_days, owner_org):
     plugin = MetricsCliPlugin()
     creds = plugin.ga4_credentials
     hostname = plugin.hostname
-    property_id = plugin.property_id
+    if property_id_override:
+        property_id = property_id_override
+    else:
+        property_id = plugin.property_id
     log.info("Starting metrics pipeline")
     try:
         MetricsPipeline(property_id, hostname, context, creds, lookback_days, owner_org).run()
