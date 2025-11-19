@@ -331,7 +331,7 @@ class CkanClient:
         {"id": "resource_id", "type": "text",
          "info": {
              "label": "Resource ID",
-             "notes": "CKAN resource UUID extracted from page_path (/resource/ )."}         },
+             "notes": "CKAN resource UUID extracted from page_path (/resource/ )."}},
         {"id": "resource_name",
          "type": "text",
          "info": {"label": "Resource name",
