@@ -250,6 +250,9 @@ class MetricsProcessor:
         return df
 
     def aggregate(self, df, aggr_map):
+        if df.empty:
+            logger.info("aggregate(): received empty DataFrame – nothing to do.")
+            return df
         # only keep aggregations for available columns
         group_by = aggr_map.pop("group_by")
         agg = {k: v for k, v in aggr_map.items() if v[0] in df.columns}
@@ -527,18 +530,37 @@ class MetricsPipeline:
         end_date = date.today().isoformat()
         # 1) Extract & transform
         dfa = self.ga4.fetch_analytics(start_date, end_date)
-        dfa = self.proc.clean(dfa)
-        dfa = self.proc.aggregate(dfa, self.proc.ANALYTICS_AGG_MAP)
 
         dfd = self.ga4.fetch_downloads(start_date, end_date)
-        dfd = self.proc.clean(dfd)
-        dfd = dfd.rename(columns={"fileName": "file_name"})
-        dfd = self.proc.aggregate(dfd, self.proc.DOWNLOADS_AGG_MAP)
 
-        config = [
-            ("Portal Analytics Data", dfa, self.ckan.ANALYTICS_DATA_DICT, ["date", "page_path"], "page_path"),
-            ("Portal Downloads Data", dfd, self.ckan.DOWNLOADS_DATA_DICT, ["date", "file_name"], "file_name")
-        ]
+        config = []
+        if not dfa.empty:
+            dfa = self.proc.clean(dfa)
+            dfa = self.proc.aggregate(dfa, self.proc.ANALYTICS_AGG_MAP)
+            config.append((
+                "Portal Analytics Data",
+                dfa,
+                self.ckan.ANALYTICS_DATA_DICT,
+                ["date", "page_path"],
+                "page_path",
+            ))
+        else:
+            logger.info("No analytics data to upsert – skipping this step.")
+
+        if not dfd.empty:
+            dfd = self.proc.clean(dfd)
+            dfd = dfd.rename(columns={"fileName": "file_name"})
+            dfd = self.proc.aggregate(dfd, self.proc.DOWNLOADS_AGG_MAP)
+            config.append((
+                "Portal Downloads Data",
+                dfd,
+                self.ckan.DOWNLOADS_DATA_DICT,
+                ["date", "file_name"],
+                "file_name",
+            ))
+        else:
+            logger.info("No download data to upsert – skipping this step.")
+
         for name, df, data_dict, pk, uuid_source in config:
             # 2) Enrich titles + org/format
             df["resource_id"] = df[uuid_source].str.extract(r"/resource/([0-9a-fA-F\-]{36})")[0]
