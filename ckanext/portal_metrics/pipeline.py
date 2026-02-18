@@ -563,9 +563,12 @@ class MetricsPipeline:
 
         for name, df, data_dict, pk, uuid_source in config:
             # 2) Enrich titles + org/format
-            df["resource_id"] = df[uuid_source].str.extract(r"/resource/([0-9a-fA-F\-]{36})")[0]
+            df["resource_id"] = df[uuid_source].str.extract(r"/resource/([0-9a-fA-F\-]{36})")[0].fillna("")
             meta = df["resource_id"].map(self.cache.get).apply(pd.Series)
             df = pd.concat([df, meta], axis=1)
+            for col in ["resource_name", "org_id", "org_name", "format", "groups"]:
+                if col in df.columns:
+                    df[col] = df[col].fillna("")
             # 3) Upsert to CKAN
             ds_id = self.ckan.ensure_dataset(self.owner_org)
             res_id = self.ckan.find_resource(ds_id, name)
