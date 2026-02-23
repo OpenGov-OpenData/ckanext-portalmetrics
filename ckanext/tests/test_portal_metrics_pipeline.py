@@ -182,6 +182,50 @@ def test_upsert_retry(monkeypatch, df_raw, tk_stub):
     assert attempts["n"] == 2
 
 
+def test_upsert_replaces_missing_values_in_create_and_upsert_payloads(monkeypatch, tk_stub):
+    create_payload = {}
+    upsert_payload = {}
+
+    def ds_create(_context, payload):
+        create_payload.update(payload)
+        return {"resource_id": "rid"}
+
+    def ds_upsert(_context, payload):
+        upsert_payload.update(payload)
+        return {"success": True}
+
+    tk_stub.get_action = lambda n: {
+        "datastore_create": ds_create,
+        "datastore_upsert": ds_upsert,
+    }[n]
+    monkeypatch.setattr(pl.time, "sleep", lambda *_: None)
+
+    df = pd.DataFrame(
+        {
+            "date": [date(2024, 1, 1)],
+            "page_path": ["/dataset/example"],
+            "resource_name": [None],
+            "org_name": [pd.NA],
+            "format": [float("nan")],
+            "groups": [pd.NaT],
+            "screen_page_views": [3],
+        }
+    )
+
+    pl.CkanClient({"user": "u"}).upsert(df, "ds", name="Test", datadict=[], pk=["date"])
+
+    created_record = create_payload["records"][0]
+    upserted_record = upsert_payload["records"][0]
+
+    for record in (created_record, upserted_record):
+        assert record["resource_name"] == ""
+        assert record["org_name"] == ""
+        assert record["format"] == ""
+        assert record["groups"] == ""
+        assert record["screen_page_views"] == 3
+        assert record["page_path"] == "/dataset/example"
+
+
 def test_resource_cache():
     class Dummy:
         def list_packages_with_resources(self, *_, **__):
@@ -243,6 +287,52 @@ def test_resource_cache_pagination(monkeypatch):
 )
 def test_pipeline(*_mocks):
     pl.MetricsPipeline("pid", "host", {"user": "u"}, object(), 1, "org").run()
+
+
+@patch.object(pl.CkanClient, "ensure_dataset", return_value="ds")
+@patch.object(pl.CkanClient, "find_resource", return_value="rid")
+@patch.object(pl.CkanClient, "list_packages_with_resources", return_value=[])
+@patch.object(
+    pl.GA4Exporter,
+    "fetch_downloads",
+    return_value=pd.DataFrame(),
+)
+@patch.object(
+    pl.GA4Exporter,
+    "fetch_analytics",
+    return_value=pd.DataFrame(
+        {
+            "date": [date.today().isoformat()],
+            "pagePath": ["/dataset/no-resource"],
+            "pageTitle": ["Dataset title"],
+            "totalUsers": [1],
+            "userEngagementDuration": [0],
+            "screenPageViews": [1],
+            "averageSessionDuration": [0],
+            "newUsers": [0],
+            "activeUsers": [0],
+        }
+    ),
+)
+def test_pipeline_sets_empty_strings_for_missing_resource_meta(
+    _fetch_analytics, _fetch_downloads, _list_pkgs, _find_resource, _ensure_dataset, monkeypatch
+):
+    captured = {}
+
+    def _capture_upsert(self, df, _dataset_id, _name, datadict, **_kwargs):
+        captured["df"] = self._normalize_for_ckan(df, datadict)
+
+    monkeypatch.setattr(pl.CkanClient, "upsert", _capture_upsert, raising=True)
+
+    pl.MetricsPipeline("pid", "host", {"user": "u"}, object(), 1, "org").run()
+
+    row = captured["df"].iloc[0]
+    assert row["resource_id"] == ""
+    assert row["resource_name"] == ""
+    assert row["org_id"] == ""
+    assert row["org_name"] == ""
+    assert row["format"] == ""
+    assert row["groups"] == ""
 
 
 def test_retry_exhaust(monkeypatch):

@@ -461,7 +461,18 @@ class CkanClient:
             if r["name"] == name:
                 return r["id"]
 
+    def _normalize_for_ckan(self, df, datadict):
+        """Ensure schema columns exist and replace missing values with empty strings."""
+        df = df.copy()
+        field_ids = [field.get("id") for field in datadict if field.get("id")]
+        missing_cols = [col for col in field_ids if col not in df.columns]
+        if missing_cols:
+            df = df.assign(**{col: "" for col in missing_cols})
+        return df.astype(object).where(pd.notna(df), "")
+
     def upsert(self, df, dataset_id, name, datadict, pk, resource_id=None):
+        # CKAN datastore should receive explicit empty strings, not NaN/NaT/None.
+        df = self._normalize_for_ckan(df, datadict)
         records = df.to_dict(orient="records")
         if not resource_id:
             payload = {
